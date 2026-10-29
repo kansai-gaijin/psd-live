@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "psd_live"
+version = "1.3.0"
+name = "PSD Live"
+tagline = "Live PSD layers flattened per name suffix into node maps"
+maintainer = "kansai-gaijin"
+website = "https://github.com/kansai-gaijin/psd-live"
+type = "add-on"
+tags = ["Material", "Node", "Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Reads PSD files and writes their maps as PNGs beside them"
