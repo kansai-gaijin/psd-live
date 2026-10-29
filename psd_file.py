@@ -8,7 +8,8 @@
 # after the whole group or layer name, spaces turned into "_" (Blood_Mask and Dirt_Mask stay apart). A
 # suffix on a group applies to the layers inside that have none of their own. Layers without a suffix
 # are ignored. Every map is flattened bottom to top with normal blending and layer opacity; hidden
-# layers are left out. Layer masks count (their own position, background colour, density and the
+# layers are left out. Layer blend modes are applied (Multiply, Screen, Overlay... see BLEND_MODES;
+# Dissolve and group blend modes act like Normal / Pass Through). Layer masks count (their own position, background colour, density and the
 # disabled flag), and a group's mask applies to every layer inside it; vector masks only when Photoshop
 # stored them rendered. A group's eye and opacity only change the Photoshop view (hide the Normal group
 # to look at the albedo and it still exports). Each map is written as a canvas-sized PNG (EXR for
@@ -31,6 +32,13 @@ ORDER = ["Albedo", "Normal", "Roughness", "Metallic", "Specular", "AO", "Height"
 STRAIGHT = {"Albedo", "Emissive"}            # colour + alpha; every other map is composited over black
 SRGB = {"Albedo", "Emissive"}
 SUFFIX = re.compile(r"_([A-Za-z0-9]+)\s*$")
+# Photoshop blend mode keys that change the result; anything else (norm, pass, diss) is Normal.
+BLEND_MODES = {"mul ": "Multiply", "scrn": "Screen", "over": "Overlay", "sLit": "Soft Light", "hLit": "Hard Light",
+               "dark": "Darken", "lite": "Lighten", "idiv": "Color Burn", "div ": "Color Dodge",
+               "lbrn": "Linear Burn", "lddg": "Linear Dodge", "diff": "Difference", "smud": "Exclusion",
+               "fsub": "Subtract", "fdiv": "Divide", "vLit": "Vivid Light", "lLit": "Linear Light",
+               "pLit": "Pin Light", "hMix": "Hard Mix", "dkCl": "Darker Color", "lgCl": "Lighter Color",
+               "hue ": "Hue", "sat ": "Saturation", "colr": "Color", "lum ": "Luminosity"}
 SOCKET_BYTES = 50    # Blender names hold 63 bytes; leave room for " Alpha" and " (2)"
 # Additional layer info keys whose length is 8 bytes in PSB files.
 _PSB_LONG = {b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2",
@@ -73,7 +81,8 @@ def read_structure(path):
             for _ in range(count):
                 t, l, b, r, nch = _rd(f, "iiiiH")
                 chans = [(_rd(f, "h")[0], _rd(f, big)[0]) for _c in range(nch)]
-                f.read(8)                               # '8BIM' + blend mode
+                f.read(4)                               # '8BIM'
+                blend = f.read(4).decode("latin-1")
                 opacity, _clip, flags, _filler = _rd(f, "BBBB")
                 extra = _rd(f, "I")[0]
                 end = f.tell() + extra
@@ -99,7 +108,7 @@ def read_structure(path):
                 f.seek(end)
                 layers.append({"name": name, "kind": kind if kind in (1, 2, 3) else LAYER,
                                "hidden": bool(flags & 2), "opacity": opacity / 255.0,
-                               "rect": (t, l, b, r), "channels": chans, "mask": mask})
+                               "rect": (t, l, b, r), "channels": chans, "mask": mask, "blend": blend})
             off = f.tell()                              # channel image data follows the records
             for L in layers:
                 L["chan_off"] = off
@@ -161,9 +170,9 @@ def mask_specs(rec):
 
 
 def plan(info):
-    """{map name: [(subimage, opacity, masks), ...] bottom to top} for the visible suffixed layers (masks
-    = the layer's own plus those of its groups), and the ordered list of every map that has at least
-    one layer (hidden ones included, so pins stay put)."""
+    """{map name: [(subimage, opacity, masks, blend key), ...] bottom to top} for the visible suffixed
+    layers (masks = the layer's own plus those of its groups), and the ordered list of every map that
+    has at least one layer (hidden ones included, so pins stay put)."""
     maps, seen, stack = {}, [], []
     recs = info["layers"]
     for k in range(len(recs) - 1, -1, -1):              # top to bottom, to know the enclosing groups
@@ -181,7 +190,7 @@ def plan(info):
         if r["hidden"]:
             maps.setdefault(m, []); continue
         masks = mask_specs(r) + [spec for g in stack for spec in g[1]]
-        maps.setdefault(m, []).insert(0, (k + 1, r["opacity"], masks))   # insert at front -> bottom to top
+        maps.setdefault(m, []).insert(0, (k + 1, r["opacity"], masks, r["blend"]))   # front -> bottom to top
     order = [m for m in ORDER if m in seen] + sorted((m for m in seen if m not in ORDER), key=str.lower)
     return order, maps
 
@@ -291,24 +300,89 @@ def _layer(ctx, sub, masks=()):
     return out
 
 
+def _lum(c):
+    return c[..., 0:1] * 0.3 + c[..., 1:2] * 0.59 + c[..., 2:3] * 0.11
+
+
+def _clip_color(c):
+    l = _lum(c); n = c.min(-1, keepdims=True); x = c.max(-1, keepdims=True)
+    c = np.where(n < 0, l + (c - l) * l / np.maximum(l - n, 1e-6), c)
+    return np.where(x > 1, l + (c - l) * (1 - l) / np.maximum(x - l, 1e-6), c)
+
+
+def _set_lum(c, l):
+    return _clip_color(c + (l - _lum(c)))
+
+
+def _set_sat(c, sat):
+    n = c.min(-1, keepdims=True); x = c.max(-1, keepdims=True); rng = x - n
+    return np.where(rng > 1e-6, (c - n) * sat / np.maximum(rng, 1e-6), 0.0)
+
+
+def _sat(c):
+    return c.max(-1, keepdims=True) - c.min(-1, keepdims=True)
+
+
+def _safe_div(a, b):
+    return a / np.where(b == 0, 1.0, b)
+
+
+def blend(key, cb, cs):
+    """Photoshop blend mode B(backdrop, source) on straight colours 0-1 (W3C compositing formulas,
+    Photoshop's own Soft Light and Hard Mix)."""
+    if key == "mul ": return cb * cs
+    if key == "scrn": return cb + cs - cb * cs
+    if key == "hLit": return np.where(cs <= 0.5, 2 * cb * cs, 1 - 2 * (1 - cb) * (1 - cs))
+    if key == "over": return np.where(cb <= 0.5, 2 * cb * cs, 1 - 2 * (1 - cb) * (1 - cs))
+    if key == "sLit": return np.where(cs <= 0.5, cb - (1 - 2 * cs) * cb * (1 - cb), cb + (2 * cs - 1) * (np.sqrt(cb) - cb))
+    if key == "dark": return np.minimum(cb, cs)
+    if key == "lite": return np.maximum(cb, cs)
+    if key == "div ":
+        return np.where(cb <= 0, 0.0, np.where(cs >= 1, 1.0, np.minimum(1.0, _safe_div(cb, 1 - cs))))
+    if key == "idiv":
+        return np.where(cb >= 1, 1.0, np.where(cs <= 0, 0.0, 1 - np.minimum(1.0, _safe_div(1 - cb, cs))))
+    if key == "lbrn": return np.maximum(0.0, cb + cs - 1)
+    if key == "lddg": return np.minimum(1.0, cb + cs)
+    if key == "diff": return np.abs(cb - cs)
+    if key == "smud": return cb + cs - 2 * cb * cs
+    if key == "fsub": return np.maximum(0.0, cb - cs)
+    if key == "fdiv": return np.where(cs <= 0, np.where(cb > 0, 1.0, 0.0), np.minimum(1.0, _safe_div(cb, cs)))
+    if key == "vLit": return np.where(cs <= 0.5, blend("idiv", cb, 2 * cs), blend("div ", cb, 2 * cs - 1))
+    if key == "lLit": return np.clip(cb + 2 * cs - 1, 0.0, 1.0)
+    if key == "pLit": return np.where(cs <= 0.5, np.minimum(cb, 2 * cs), np.maximum(cb, 2 * cs - 1))
+    if key == "hMix": return np.where(cb + cs >= 1.0 - 1e-6, 1.0, 0.0)
+    if key == "dkCl": return np.where(_lum(cs) < _lum(cb), cs, cb)
+    if key == "lgCl": return np.where(_lum(cs) > _lum(cb), cs, cb)
+    if key == "hue ": return _set_lum(_set_sat(cs, _sat(cb)), _lum(cb))
+    if key == "sat ": return _set_lum(_set_sat(cb, _sat(cs)), _lum(cb))
+    if key == "colr": return _set_lum(cs, _lum(cb))
+    if key == "lum ": return _set_lum(cb, _lum(cs))
+    return cs
+
+
 def flatten(ctx, name, layers):
     """One map: premultiplied 'over' bottom to top, then encoded for its kind."""
     W, H, full, np_t = ctx["W"], ctx["H"], ctx["full"], ctx["np_t"]
     rnd = 0.0 if np_t is np.float32 else 0.5
-    if len(layers) == 1 and layers[0][1] >= 1.0:          # one opaque layer: the map is that layer as is
-        L = _layer(ctx, layers[0][0], layers[0][2])
+    if len(layers) == 1 and layers[0][1] >= 1.0 and (name != "Normal" or layers[0][3] not in BLEND_MODES):
+        L = _layer(ctx, layers[0][0], layers[0][2])         # one opaque layer on nothing: the map is that layer
         if L is not None and L[..., 3].min() >= 1.0:
             return np.clip(L * full + rnd, 0, full).astype(np_t)
     rgb = np.zeros((H, W, 3), np.float32); a = np.zeros((H, W, 1), np.float32)
     if name == "Normal":
         rgb[...] = (0.5, 0.5, 1.0); a[...] = 1.0
-    for sub, op, masks in layers:
+    for sub, op, masks, key in layers:
         L = _layer(ctx, sub, masks) if op > 0 else None
         if L is None:
             continue
         for y in range(0, H, 512):                       # chunked to keep temporaries small
             la = L[y:y + 512, :, 3:4] * op
-            rgb[y:y + 512] = rgb[y:y + 512] * (1 - la) + L[y:y + 512, :, :3] * la
+            cs = L[y:y + 512, :, :3]
+            if key in BLEND_MODES:                       # W3C: Cs' = (1 - ab) Cs + ab B(Cb, Cs), then 'over'
+                ab = a[y:y + 512]
+                cb = np.clip(np.where(ab > 1e-6, rgb[y:y + 512] / np.maximum(ab, 1e-6), 0.0), 0.0, 1.0)
+                cs = (1 - ab) * cs + ab * np.clip(blend(key, cb, cs), 0.0, 1.0)
+            rgb[y:y + 512] = rgb[y:y + 512] * (1 - la) + cs * la
             a[y:y + 512] = a[y:y + 512] * (1 - la) + la
         del L
     out = np.empty((H, W, 4), np_t)

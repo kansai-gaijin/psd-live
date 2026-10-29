@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "psd_live"
-version = "1.4.1"
+version = "1.5.0"
 name = "PSD Live"
 tagline = "Live PSD layers flattened per name suffix into node maps"
 maintainer = "kansai-gaijin"
