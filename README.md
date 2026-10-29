@@ -16,11 +16,13 @@ It's meant for authoring: paint in Photoshop, preview in Blender, then bake the 
 
 Requires Blender 4.2 or newer. It was developed on Blender 5.2 on Windows.
 
-1. Build the extension zip from this folder:
-   ```bash
-   blender --command extension build --source-dir psd-live --output-dir .
-   ```
-2. Drag the resulting `psd_live-<version>.zip` onto the Blender window, or use **Edit → Preferences → Get Extensions → Install from Disk**.
+1. Download `psd_live-<version>.zip` from the [latest release](https://github.com/kansai-gaijin/psd-live/releases/latest).
+2. Drag the zip onto the Blender window, or use **Edit → Preferences → Get Extensions → Install from Disk**.
+
+To build the zip yourself from a clone instead:
+```bash
+blender --command extension build --source-dir psd-live --output-dir .
+```
 
 ## Use
 
