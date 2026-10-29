@@ -8,7 +8,9 @@
 # after the whole group or layer name, spaces turned into "_" (Blood_Mask and Dirt_Mask stay apart). A
 # suffix on a group applies to the layers inside that have none of their own. Layers without a suffix
 # are ignored. Every map is flattened bottom to top with normal blending and layer opacity; hidden
-# layers are left out. A group's eye and opacity only change the Photoshop view (hide the Normal group
+# layers are left out. Layer masks count (their own position, background colour, density and the
+# disabled flag), and a group's mask applies to every layer inside it; vector masks only when Photoshop
+# stored them rendered. A group's eye and opacity only change the Photoshop view (hide the Normal group
 # to look at the albedo and it still exports). Each map is written as a canvas-sized PNG (EXR for
 # 32-bit files) into <stem>_maps/ beside the PSD; unchanged maps are not rewritten.
 import os, re, struct, zlib
@@ -54,7 +56,8 @@ def map_of(name):
 
 
 def read_structure(path):
-    """Canvas size, bit depth and the layer records bottom to top: name, kind, hidden, opacity."""
+    """Canvas size, bit depth and the layer records bottom to top: name, kind, hidden, opacity, rect,
+    channels (id, length), file offset of their pixel data and the layer mask settings."""
     with open(path, "rb") as f:
         sig, ver = _rd(f, "4sH")
         if sig != b"8BPS" or ver not in (1, 2):
@@ -68,13 +71,13 @@ def read_structure(path):
         if _rd(f, big)[0] and _rd(f, big)[0]:           # layer and mask section, layer info
             count = abs(_rd(f, "h")[0])
             for _ in range(count):
-                _t, _l, _b, _r, nch = _rd(f, "iiiiH")
-                f.seek(nch * (2 + (8 if ver == 2 else 4)), 1)
+                t, l, b, r, nch = _rd(f, "iiiiH")
+                chans = [(_rd(f, "h")[0], _rd(f, big)[0]) for _c in range(nch)]
                 f.read(8)                               # '8BIM' + blend mode
                 opacity, _clip, flags, _filler = _rd(f, "BBBB")
                 extra = _rd(f, "I")[0]
                 end = f.tell() + extra
-                f.seek(_rd(f, "I")[0], 1)               # layer mask data
+                mask = _read_mask_data(f)
                 f.seek(_rd(f, "I")[0], 1)               # blending ranges
                 n = f.read(1)[0]
                 name = f.read(n).decode("latin-1")
@@ -95,30 +98,90 @@ def read_structure(path):
                         kind = struct.unpack(">I", data[:4])[0]
                 f.seek(end)
                 layers.append({"name": name, "kind": kind if kind in (1, 2, 3) else LAYER,
-                               "hidden": bool(flags & 2), "opacity": opacity / 255.0})
-    return {"W": W, "H": H, "depth": depth, "mode": mode, "layers": layers}
+                               "hidden": bool(flags & 2), "opacity": opacity / 255.0,
+                               "rect": (t, l, b, r), "channels": chans, "mask": mask})
+            off = f.tell()                              # channel image data follows the records
+            for L in layers:
+                L["chan_off"] = off
+                off += sum(n for _i, n in L["channels"])
+    return {"W": W, "H": H, "depth": depth, "mode": mode, "version": ver, "layers": layers}
+
+
+def _read_mask_data(f):
+    """The layer mask data block: rect, background colour, flags, densities and, when a layer has both
+    a pixel mask and a vector mask, the 'real' rect/background/flags of the pixel mask (channel -3)."""
+    size = _rd(f, "I")[0]
+    end = f.tell() + size
+    mask = None
+    if size >= 18:
+        rect = _rd(f, "iiii")
+        default, flags = _rd(f, "BB")
+        udens = vdens = 1.0
+        real = None
+        if size > 18 and flags & 16:                    # mask parameters (else size 20 = padding)
+            pf = _rd(f, "B")[0]
+            if pf & 1: udens = _rd(f, "B")[0] / 255.0
+            if pf & 2: f.read(8)                        # user mask feather (not applied)
+            if pf & 4: vdens = _rd(f, "B")[0] / 255.0
+            if pf & 8: f.read(8)                        # vector mask feather
+        if size > 20:
+            if f.tell() + 18 <= end:
+                rflags, rdefault = _rd(f, "BB")
+                real = (_rd(f, "iiii"), rdefault, rflags)
+        mask = {"rect": rect, "default": default, "flags": flags, "udens": udens, "vdens": vdens, "real": real}
+    f.seek(end)
+    return mask
+
+
+def mask_specs(rec):
+    """Masks to multiply into a record's alpha: (file offset, length, rect, background 0-255, density)."""
+    m = rec.get("mask")
+    if not m:
+        return []
+    offs, o = {}, rec["chan_off"]
+    for cid, n in rec["channels"]:
+        offs[cid] = (o, n); o += n
+
+    def placed(rect, flags):
+        if flags & 1:                                   # position relative to the layer
+            t, l = rec["rect"][:2]
+            return (rect[0] + t, rect[1] + l, rect[2] + t, rect[3] + l)
+        return rect
+    out = []
+    if -3 in offs and m["real"]:                        # pixel mask + vector mask
+        rect, default, rflags = m["real"]
+        if not rflags & 2:
+            out.append(offs[-3] + (placed(rect, rflags), default, m["udens"]))
+        if -2 in offs and not m["flags"] & 2:
+            out.append(offs[-2] + (placed(m["rect"], m["flags"]), m["default"], m["vdens"]))
+    elif -2 in offs and not m["flags"] & 2:
+        dens = m["vdens"] if m["flags"] & 8 else m["udens"]   # bit 3: rendered from a vector mask
+        out.append(offs[-2] + (placed(m["rect"], m["flags"]), m["default"], dens))
+    return out
 
 
 def plan(info):
-    """{map name: [(subimage, opacity), ...] bottom to top} for the visible suffixed layers, plus the
-    ordered list of every map that has at least one layer (hidden ones included, so pins stay put)."""
+    """{map name: [(subimage, opacity, masks), ...] bottom to top} for the visible suffixed layers (masks
+    = the layer's own plus those of its groups), and the ordered list of every map that has at least
+    one layer (hidden ones included, so pins stay put)."""
     maps, seen, stack = {}, [], []
     recs = info["layers"]
     for k in range(len(recs) - 1, -1, -1):              # top to bottom, to know the enclosing groups
         r = recs[k]
         if r["kind"] in (FOLDER_OPEN, FOLDER_CLOSED):
-            stack.append(map_of(r["name"])); continue
+            stack.append((map_of(r["name"]), mask_specs(r))); continue
         if r["kind"] == GROUP_END:
             if stack: stack.pop()
             continue
-        m = map_of(r["name"]) or next((g for g in reversed(stack) if g), None)
+        m = map_of(r["name"]) or next((g[0] for g in reversed(stack) if g[0]), None)
         if m is None:
             continue
         if m not in seen:
             seen.append(m)
         if r["hidden"]:
             maps.setdefault(m, []); continue
-        maps.setdefault(m, []).insert(0, (k + 1, r["opacity"]))   # insert at front -> bottom to top
+        masks = mask_specs(r) + [spec for g in stack for spec in g[1]]
+        maps.setdefault(m, []).insert(0, (k + 1, r["opacity"], masks))   # insert at front -> bottom to top
     order = [m for m in ORDER if m in seen] + sorted((m for m in seen if m not in ORDER), key=str.lower)
     return order, maps
 
@@ -148,14 +211,67 @@ def _write(fn, arr, fmt):
     os.replace(tmp, fn)
 
 
-def _layer(inp, sub, W, H, read_t, full, np_t):
-    """Layer subimage placed on the canvas as float32 RGBA 0-1 (None if empty)."""
+def _unpackbits(data, n):
+    out = bytearray(); i = 0; size = len(data)
+    while i < size and len(out) < n:
+        h = data[i]; i += 1
+        if h < 128:
+            out += data[i:i + h + 1]; i += h + 1
+        elif h > 128:
+            out += data[i:i + 1] * (257 - h); i += 1
+    return bytes(out[:n]).ljust(n, b"\0")
+
+
+def read_mask(ctx, spec):
+    """One mask channel as a canvas-sized float32 0-1 (background colour outside its rect)."""
+    off, length, (t, l, b, r), default, dens = spec
+    W, H, depth = ctx["W"], ctx["H"], ctx["depth"]
+    canvas = np.full((H, W), default / 255.0, np.float32)
+    w, h = r - l, b - t
+    if w > 0 and h > 0 and length > 2:
+        f = ctx["fh"]; f.seek(off)
+        comp = _rd(f, "H")[0]; data = f.read(length - 2)
+        bpp = max(1, depth // 8); n = w * h * bpp
+        if comp == 0:
+            raw = data[:n]
+        elif comp == 1:
+            raw = _unpackbits(data[h * (4 if ctx["version"] == 2 else 2):], n)
+        elif comp in (2, 3):
+            raw = zlib.decompress(data)
+        else:
+            raise RuntimeError("unknown mask compression %d" % comp)
+        raw = raw.ljust(n, b"\0")[:n]
+        if depth == 32:
+            if comp == 3:                               # byte planes per row, delta coded
+                a = np.cumsum(np.frombuffer(raw, np.uint8).reshape(h, w * 4), axis=1, dtype=np.uint8)
+                raw = a.reshape(h, 4, w).transpose(0, 2, 1).tobytes()
+            px = np.frombuffer(raw, ">f4").reshape(h, w).astype(np.float32)
+        elif depth == 16:
+            px = np.frombuffer(raw, ">u2").reshape(h, w)
+            if comp == 3: px = np.cumsum(px, axis=1, dtype=np.uint16)
+            px = px.astype(np.float32) / 65535.0
+        else:
+            px = np.frombuffer(raw, np.uint8).reshape(h, w)
+            if comp == 3: px = np.cumsum(px, axis=1, dtype=np.uint8)
+            px = px.astype(np.float32) / 255.0
+        sx0, sy0, dx0, dy0 = max(0, -l), max(0, -t), max(0, l), max(0, t)
+        cw, ch = min(w - sx0, W - dx0), min(h - sy0, H - dy0)
+        if cw > 0 and ch > 0:
+            canvas[dy0:dy0 + ch, dx0:dx0 + cw] = px[sy0:sy0 + ch, sx0:sx0 + cw]
+    if dens < 1.0:
+        canvas = 1.0 - dens * (1.0 - canvas)
+    return canvas
+
+
+def _layer(ctx, sub, masks=()):
+    """Layer subimage placed on the canvas as float32 RGBA 0-1, masks applied (None if empty)."""
+    inp, W, H, full = ctx["inp"], ctx["W"], ctx["H"], ctx["full"]
     if not inp.seek_subimage(sub, 0):
         raise RuntimeError("layer count mismatch (file still being written?)")
     spec = inp.spec()
     if spec.width <= 0 or spec.height <= 0:
         return None
-    px = inp.read_image(sub, 0, 0, spec.nchannels, read_t)
+    px = inp.read_image(sub, 0, 0, spec.nchannels, ctx["read_t"])
     if px is None:
         raise RuntimeError(inp.geterror() or "cannot read layer %d" % sub)
     px = px.reshape(spec.height, spec.width, spec.nchannels)
@@ -170,22 +286,25 @@ def _layer(inp, sub, W, H, read_t, full, np_t):
     out[dy0:dy0 + h, dx0:dx0 + w, :c] = src[..., :c]
     if c < 4:
         out[dy0:dy0 + h, dx0:dx0 + w, 3] = 1.0
+    for spec_m in masks:
+        out[..., 3] *= read_mask(ctx, spec_m)
     return out
 
 
-def flatten(inp, name, layers, W, H, read_t, full, np_t):
+def flatten(ctx, name, layers):
     """One map: premultiplied 'over' bottom to top, then encoded for its kind."""
+    W, H, full, np_t = ctx["W"], ctx["H"], ctx["full"], ctx["np_t"]
     rnd = 0.0 if np_t is np.float32 else 0.5
     if len(layers) == 1 and layers[0][1] >= 1.0:          # one opaque layer: the map is that layer as is
-        L = _layer(inp, layers[0][0], W, H, read_t, full, np_t)
+        L = _layer(ctx, layers[0][0], layers[0][2])
         if L is not None and L[..., 3].min() >= 1.0:
             return np.clip(L * full + rnd, 0, full).astype(np_t)
     rgb = np.zeros((H, W, 3), np.float32); a = np.zeros((H, W, 1), np.float32)
     if name == "Normal":
         rgb[...] = (0.5, 0.5, 1.0); a[...] = 1.0
-    for sub, op in layers:
-        L = _layer(inp, sub, W, H, read_t, full, np_t)
-        if L is None or op <= 0:
+    for sub, op, masks in layers:
+        L = _layer(ctx, sub, masks) if op > 0 else None
+        if L is None:
             continue
         for y in range(0, H, 512):                       # chunked to keep temporaries small
             la = L[y:y + 512, :, 3:4] * op
@@ -224,10 +343,13 @@ def export(path, cache_dir, prev_hashes):
     inp = oiio.ImageInput.open(path)
     if inp is None:
         raise RuntimeError(oiio.geterror() or "cannot open PSD")
+    fh = open(path, "rb")                                 # for the mask channels
+    ctx = {"inp": inp, "fh": fh, "W": W, "H": H, "depth": depth, "version": info["version"],
+           "read_t": read_t, "full": full, "np_t": np_t}
     entries, hashes, files = [], {}, set()
     try:
         for m in order:
-            img = np.ascontiguousarray(flatten(inp, m, maps.get(m, []), W, H, read_t, full, np_t))
+            img = np.ascontiguousarray(flatten(ctx, m, maps.get(m, [])))
             hsh = zlib.adler32(img.data) ^ (W << 20) ^ H
             fn = os.path.join(cache_dir, "%s_%s%s" % (stem, re.sub(r'[<>:"/\\|?*]', "_", m), ext))
             changed = prev_hashes.get(m) != hsh or not os.path.exists(fn)
@@ -238,7 +360,7 @@ def export(path, cache_dir, prev_hashes):
             entries.append({"key": m, "name": "%s_%s" % (stem, m), "socket": socks[m], "file": fn, "changed": changed,
                             "srgb": m in SRGB, "layers": len(maps.get(m, []))})
     finally:
-        inp.close()
+        inp.close(); fh.close()
     if file_sig(path) != sig:
         raise RuntimeError("file changed while reading")
     for f in os.listdir(cache_dir):                       # maps that no longer exist

@@ -9,6 +9,7 @@ It's meant for authoring: paint in Photoshop, preview in Blender, then bake the 
 - **One shader node, one pin per map.** It renders in EEVEE and Cycles like any node group.
 - **Live reload.** It watches the file and only reloads maps whose pixels changed. Decoding runs on a background thread, so Blender doesn't freeze.
 - **As many layers per map as you like.** Stack any number of `_A` layers, or groups, and they flatten into one Albedo map with normal blending and layer opacity.
+- **Layer masks count.** Masks on layers and on groups are applied, using their position, background colour, density and on/off state, so you can paint non-destructively.
 - **Masks and custom maps.** Any suffix PSD Live doesn't know becomes its own map, named after the group or layer: `Blood_Mask`, `Dirt_Mask`, `Wet_Gloss`...
 - **Nothing to install besides the add-on.** It uses the OpenImageIO library that ships with Blender. 8, 16 and 32-bit documents are supported.
 
@@ -60,6 +61,7 @@ The text after the **last underscore** of a layer or group name decides which ma
 - **Unknown suffixes keep their full name.** `Blood_Mask` and `Dirt_Mask` are two separate pins. Spaces become underscores, so a group named `Dirt Splat_Mask` gives the pin `Dirt_Splat_Mask`. Two groups with exactly the same name merge into one map.
 - **A layer's eye decides whether it counts.** Hidden layers are left out of the map.
 - **A group's eye and opacity only change the Photoshop view.** Hide the Normal group to look at your albedo and the normal map still reaches Blender.
+- **Layer masks are applied.** A mask on a layer cuts that layer. A mask on a group cuts every layer inside it, the one group setting that changes content and not just the view. A disabled mask (Shift+click its thumbnail) is ignored, and mask density is respected.
 
 ### An example document
 
@@ -79,7 +81,7 @@ This gives four pins: **Albedo**, **Normal**, **Roughness** and **Blood_Mask**.
 
 ## How it works
 
-- **Background thread:** reads the PSD and flattens each map bottom to top: normal blending, layer opacity, hidden layers skipped. Each map is written as a full-canvas PNG (EXR for 32-bit documents) into `<psd name>_maps/` next to the PSD. Only maps whose pixels changed are rewritten.
+- **Background thread:** reads the PSD and flattens each map bottom to top: normal blending, layer opacity, layer and group masks, hidden layers skipped. Each map is written as a full-canvas PNG (EXR for 32-bit documents) into `<psd name>_maps/` next to the PSD. Only maps whose pixels changed are rewritten.
 - **The images:** ordinary file images named `<psd name>_<Map>`, so they save with your .blend and work after reopening without re-reading the PSD.
 - **The node:** a custom group node whose internal tree holds one Image Texture per map. It uses the mesh's UVs, or whatever you plug into its **Vector** input.
 - **Watching:** a timer checks the PSD's modified time twice a second and re-reads once a save has settled. An update covers all maps, so a document with several 4K maps takes a few seconds to come through.
@@ -87,7 +89,8 @@ This gives four pins: **Albedo**, **Normal**, **Roughness** and **Blood_Mask**.
 
 ## Limitations
 
-- **Normal blending only.** Blend modes, layer masks, clipping masks, layer effects and adjustment layers are ignored. Each layer contributes its own pixels at its own opacity. Smart objects and text layers work through the rasterised pixels Photoshop stores.
+- **Normal blending only.** Blend modes, clipping masks, layer effects and adjustment layers are ignored. Each layer contributes its own pixels at its opacity and through its masks. Smart objects and text layers work through the rasterised pixels Photoshop stores.
+- **Masks:** mask feather is ignored, so apply it to the mask pixels instead. Vector (shape) masks are only applied when Photoshop has stored a rendered copy of them.
 - **Normal maps** are blended like colour and then re-normalised. That's fine for painting, but it isn't a dedicated detail-normal blend.
 - **The node needs the add-on installed to render.** Bake your final textures before handing a .blend to someone without it.
 - **One image per map.** UDIM tiles aren't supported, but images repeat, so a single tile on UDIM 1001 or 1002 still lines up.
