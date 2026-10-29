@@ -340,7 +340,9 @@ def export(path, cache_dir, prev_hashes):
     else:
         np_t, oi_t, ext, read_t, full = np.uint8, oiio.UINT8, ".png", "uint8", 255.0
     os.makedirs(cache_dir, exist_ok=True)
-    inp = oiio.ImageInput.open(path)
+    config = oiio.ImageSpec()
+    config.attribute("oiio:UnassociatedAlpha", 1)         # keep Photoshop's straight colour; OIIO premultiplies by
+    inp = oiio.ImageInput.open(path, config)               # default, which darkened every soft edge a second time
     if inp is None:
         raise RuntimeError(oiio.geterror() or "cannot open PSD")
     fh = open(path, "rb")                                 # for the mask channels
